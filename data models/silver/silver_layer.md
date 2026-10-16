@@ -2,7 +2,7 @@
 
 This document defines the silver layer: its tables, columns, keys, relationships, derived fields, cleaning rules, PII handling and data quality checks. It is the reference for anyone building or using silver tables.
 
-**Scope.** Which fields are in silver, which are not, and which are new. Not covered: pipeline design, load logic, and dimensional or gold modeling.
+**Scope.** Which fields are in silver, which are not, and which are new, and the steps that build silver from bronze (sections 15 to 17).
 
 ## Contents
 
@@ -20,10 +20,13 @@ This document defines the silver layer: its tables, columns, keys, relationships
 - [12. PII and data protection](#12-pii-and-data-protection)
 - [13. Data quality checks](#13-data-quality-checks)
 - [14. Assumptions and open items](#14-assumptions-and-open-items)
+- [15. Build steps: bronze to silver](#15-build-steps-bronze-to-silver)
+- [16. Run-level checks and monitoring](#16-run-level-checks-and-monitoring)
+- [17. Maintenance and reprocessing](#17-maintenance-and-reprocessing)
 
 ## 1. Overview
 
-Bronze keeps every source document exactly as received, stored in Delta, with no changes. Silver is the cleaned, typed and de-duplicated layer built from it. Every silver row can be traced back to its bronze document and version.
+Bronze keeps every source document exactly as received, stored in Delta, with no changes. Silver is the cleaned, typed and de-duplicated layer built from it. Every silver row can be traced back to its bronze document and version. The steps that turn bronze into silver (type conversion, null handling, cleaning, validation and loading) are in [section 15](#15-build-steps-bronze-to-silver).
 
 Silver has **8 tables** and **8 relationships**, grouped in three domains:
 
@@ -37,9 +40,9 @@ Silver has **8 tables** and **8 relationships**, grouped in three domains:
 
 ## 2. ER diagram
 
-Click the image to open it at full size. The SVG zooms without losing sharpness. A PNG copy is in [silver_er_diagram.png](silver_er_diagram.png).
+Click the image to open it at full size.
 
-[![Silver layer ER diagram](silver_er_diagram.svg)](silver_er_diagram.svg)
+[![Silver layer ER diagram](silver_er_diagram.png)](silver_er_diagram.png)
 
 How to read it:
 
@@ -708,7 +711,7 @@ Bronze keeps every field. This section records which source fields are not in si
 
 ## 11. Cleaning rules
 
-Rules applied to every silver table.
+Rules applied to every silver table. This is the short list. The full procedure, step by step, is in [section 15](#15-build-steps-bronze-to-silver).
 
 | Rule | Detail |
 |---|---|
@@ -742,11 +745,7 @@ Silver keeps personal data values as they are, because joins, audit and support 
 |---|---|
 | Classify every column | The class is stored in table metadata so access policies can use it. Without native tags, keep the column list above as the source of truth. |
 | Credentials stay in bronze | `password` never enters silver. Because bronze is unmasked, bronze access is limited to the pipeline service identity. |
-| Least privilege | Tables with PII-direct or PII-contact columns are readable only by approved roles. Everyone else reads masked views. |
-| Mask at read | Column masks or masked views cover PII-direct and PII-contact columns. Stored silver values are not altered. |
-| Pseudonymous keys downstream | Analytics use `user_id`. If an email join is unavoidable, use a keyed (salted) hash, never a plain hash. |
-| Minimization | `_meta.by` (an email) is not copied. Only personal fields with a stated use are kept. |
-| Erasure and retention | Deletion requests are keyed on `user_id`, which appears in `USERS`, `USER_ITEM` and `ORDERS`. A deletion must reach bronze, silver and older Delta file versions within the retention policy. |
+
 
 ## 13. Data quality checks
 
@@ -763,9 +762,7 @@ Delta key constraints are informational at best (open-source Delta enforces only
 | 5 | Orphan rate against `SUPPLIER_PRODUCT` is recorded. Orphans are expected for some items and bill lines. | `USER_ITEM`, `ORDER_LINE`, `BILL_LINE` |
 | 6 | `silver_loaded_at` is not null. | All tables |
 | 7 | `po_status` is `SUCCESS` or `ERROR`. `channel` is `web`, `email`, `direct` or null. | `ORDER_SUPPLIER_PO` |
-| 8 | Bill reconciliation difference is reported, and bills outside a set tolerance are listed. | `BILLS` |
-| 9 | No replacement characters (`ÔøΩ`) remain in name columns. | `SUPPLIER_PRODUCT`, `BILL_LINE` |
-| 10 | `BILL_LINE.supplier_code` equals the `supplier_code` of its parent bill. | `BILL_LINE` |
+| 8 | `BILL_LINE.supplier_code` equals the `supplier_code` of its parent bill. | `BILL_LINE` |
 
 ### 13.2 One-time validation on the full bronze data
 
@@ -788,11 +785,189 @@ Several decisions rest on the sample data. Confirm them once on the full data. N
 |---|---|---|---|
 | 1 | Source of `SUPPLIER_PRODUCT` | A product reference built from supplier and SKU data in bronze. The source collection, and which source wins on conflicting names, is not settled. | Data owner |
 | 2 | What `ORDERS.order_by` references | Plain column. A user id would add a foreign key to `USERS`. An email would make it PII-direct. | Data owner |
-| 3 | Bronze ingestion time | Bronze stays unchanged, so an ingestion time may not exist. Preferred: the ingestion step adds an ingestion time and batch id as metadata columns, which does not change the source data. Otherwise use platform file or commit metadata, which is per batch, not per record. | Platform team |
+| 3 | Bronze ingestion time | Bronze stays unchanged, so an ingestion time may not exist. Adopted in [bronze_layer.md](../bronze/bronze_layer.md): the ingestion step adds `bronze_ingested_at` and `bronze_batch_id` as metadata columns, which does not change the source data. Needs confirmation. | Platform team |
 | 4 | Meaning of `price` on lines | Line total. If confirmed, consider naming it `line_total`. | Data owner |
 | 5 | History | Silver keeps the latest version per key only. Delta time travel is not a business history. A history table is needed if status changes must be analyzed over time. | Product owner |
 | 6 | Supplier codes across orders and bills | Bill supplier codes are assumed to equal the codes in `SUPPLIER_PRODUCT`. The source notes say bills may use a different code system from orders. If the match rate is low, a supplier master or code mapping is needed. | Data owner |
 | 7 | Fields with assumed meaning | `subgroup_id` is the primary subgroup, `supplier_login_count` is an engagement signal, `flink` and `price_synced_at` and `master_updated_at` are operational. Defaults: keep `order_email_disabled`, `approval_email_disabled`, `supplier_login_count` and `supplier_address`; exclude `flink`, `price_synced_at`, `master_updated_at`, `location_name` and `started_processing_at`. | Data owner |
 | 8 | Order rollups | The counts and supplier arrays on `ORDERS` stay out of silver, because they can be derived from the PO rows. | Data owner |
 | 9 | Bill line product id | `BILL_LINE.supplier_product_id` is assumed to be the supplier SKU. A size suffix on the printed value may reduce matches. | Data owner |
+| 10 | Deleted documents | An incremental export cannot see deletions, so deleted source documents stay in silver. An occasional full export could detect them. Whether silver should drop, flag or keep them is not decided. | Product owner |
+| 11 | Supplier in neither list | `po_status` is required. A supplier that is in neither the success nor the error list in the bronze order causes the order to be rejected. Confirm every order has the lists, or give a rule for older orders. | Data owner |
+| 12 | What a real supplier order id looks like | Assumed: no spaces, and only letters, digits and hyphens. Anything else is treated as free text and becomes null. | Data owner |
+| 13 | Date formats and placeholder text | Bill dates are assumed to be ISO. The placeholder texts treated as null are `null`, `undefined`, `nan` and `n/a`. Confirm both on the full data. | Data owner |
 
+## 15. Build steps: bronze to silver
+
+Sections 1 to 14 define what silver contains. This section defines how silver is built from bronze, step by step. Section 11 is the short rule list. This section is the full procedure behind it.
+
+### 15.1 Overview
+
+Silver is built in **four phases and eleven steps**. Every run applies the same steps to every table. Only new bronze rows are processed in a run.
+
+| Phase | Steps | Purpose |
+|---|---|---|
+| Prepare | 1 Select new rows, 2 Keep latest version | Decide which documents are processed. |
+| Shape | 3 Flatten and rename, 4 Split into child rows | Turn nested documents into flat tables. |
+| Clean | 5 Convert types, 6 Handle nulls, 7 Clean text, 8 Apply business rules | Make every value correctly typed and consistent. |
+| Load | 9 Add audit columns, 10 Validate, 11 Write | Check the result and publish it. |
+
+
+### 15.2 Run model
+
+| Topic | Rule |
+|---|---|
+| Batch, not streaming | A scheduled run reads bronze rows loaded since the last successful silver run, builds silver, and stops. |
+| What counts as new | Rows whose `bronze_batch_id` is not yet recorded as processed in the run log. |
+| First run | The same steps, applied to all of bronze. It can be done in chunks. |
+| Re-run | Safe. Upserts by key mean a second run of the same batch gives the same result. |
+| Old or repeated versions | A version older than the one already in silver is ignored. The same version delivered twice is processed once. |
+| Failure | If a run fails, nothing is recorded as processed, so the next run picks the same rows up again. |
+| Deleted documents | Not handled yet (see open item 10 in [section 14](#14-assumptions-and-open-items)). |
+
+### 15.3 Step 1: Select new rows
+
+Read only the bronze rows from batches not yet processed. Rows with an empty or unreadable document id cannot be keyed and go to the reject table with the reason `missing document id`.
+
+### 15.4 Step 2: Keep latest version
+
+Bronze holds every version of a document. Silver keeps one row per document id.
+
+| Rule | Detail |
+|---|---|
+| Ordering | Latest `_meta.at` wins. |
+| Ties | Bills break ties on `tlm`. Other tables break ties on the latest `bronze_ingested_at`. |
+| No `_meta.at` | The row is ranked by `bronze_ingested_at`. |
+| Compared with silver | The winning version replaces the stored row only if its `src_meta_at` is the same or newer. |
+| Children | Child rows always come from the same version as their parent. |
+
+### 15.5 Step 3: Flatten and rename
+
+Nested documents become flat columns. The renames and merges are listed in [section 10.1](#101-renamed-converted-and-merged-fields). In summary: `_id.$oid` becomes the text key, `meta_*` fields become `src_*` columns, `phone_no` and `phone_nos` merge into one array, `event_name` merges into `event`, and the order address lines are joined into one text in their original order, separated by a comma and a space.
+
+### 15.6 Step 4: Split into child rows
+
+| Child table | Comes from | One row per | Key rule |
+|---|---|---|---|
+| `USER_ITEM` | Cart, price comparison and price cache in the users document | Distinct item key | Key `SUP:SKU` is split on the first colon. The same key found in more than one source is merged into one row. |
+| `ORDER_SUPPLIER_PO` | Supplier map in the orders document | Supplier in the order | `supplier_code` is the map key. Suppliers whose order failed also get a row. |
+| `ORDER_LINE` | Order lines array | Array element | `line_no` is the 1-based position. Lowest-price fields come from a `SUP:SKU` key split on the first colon. |
+| `BILL_LINE` | Bill lines array | Array element | `line_no` is the 1-based position. `supplier_code` is copied from the bill. |
+
+### 15.7 Step 5: Convert types
+
+Bronze holds simple values as text. This step gives every column its final type. Conversions are safe: a value that cannot be converted becomes null, and the failure is logged with the document id, column and raw value. It does not stop the run (see [section 16](#16-run-level-checks-and-monitoring) for the limits).
+
+| Source form | Silver type | Columns | Rule |
+|---|---|---|---|
+| `{"$oid": ...}` | `STRING` | `user_id`, `order_id`, `bill_id` | The text inside `$oid`. |
+| `$date` object, epoch number, or ISO text | `TIMESTAMP`, UTC | All `*_at` columns, `fetched_at`, `event_processed` | A number below 100,000,000,000 is read as seconds, otherwise as milliseconds. ISO text with no zone is read as UTC. |
+| Calendar date text | `DATE` | `inv_date`, `due_date` | ISO dates are read directly. A date-time is cut to its date. Any other format is a conversion failure until the formats on the full data are known. |
+| Money as text or float | `DECIMAL(12,2)` | All amounts, `price` on lines, `BILL_LINE.qty` | Currency symbols, spaces and thousands commas are removed. A full stop is the decimal mark. Brackets mean negative. Extra decimals are rounded half up. A value too large for 12 digits is a failure. |
+| Unit prices as text or float | `DECIMAL(12,4)` | `unit_price`, `lowest_price`, `max_price`, `price_tier_1` | Same rules, four decimal places. |
+| Counts as text or number | `INT` | `qty` on user items and order lines, `incr_qty`, `lowest_price_qty`, `line_no`, `page_from`, `page_to`, `supplier_login_count` | Whole numbers only. `3.0` becomes 3. `2.5` is a failure (see one-time check 6 in [section 13.2](#132-one-time-validation-on-the-full-bronze-data)). |
+| Flags | `BOOLEAN` | All `is_*`, `has_*`, `edit_*`, `*_disabled`, `*_verified`, `invite_accepted`, `available_on_call` and similar | `true`, `false`, `1`, `0`, `yes`, `no`, in any letter case. Anything else is a failure. |
+| One value or a list | `ARRAY<STRING>` | `phone_nos`, `subgroup_ids`, `role_ids`, `department_ids`, `user_type` | A single value becomes a list of one. Items are trimmed, blanks removed, duplicates removed, order kept. |
+| Price list keyed by `SUP:SKU` | `MAP<STRING,DECIMAL(12,4)>` | `compared_prices` | Keys stay as written. An entry whose price fails to convert is dropped and logged. |
+| Codes and identifiers | `STRING` | `zip_code`, `supplier_code`, `supplier_sku`, all `*_id` | Never converted to numbers. Leading zeros are kept. |
+| JSON kept as text | `STRING` | `approval_info` | Kept as text. Structure to be confirmed. |
+
+### 15.8 Step 6: Handle nulls
+
+Silver does not guess. It makes "no value" look the same everywhere, and it never invents a value.
+
+| # | Rule | Detail |
+|---|---|---|
+| 1 | Empty values become null | An empty text, a text of spaces only, an empty `{}` or `[]` where a value is expected. |
+| 2 | Placeholder text becomes null | The texts `null`, `undefined`, `nan` and `n/a`, in any letter case, in every text column except the as-printed columns listed in step 7. Short texts such as `NA` or `-` are not on the list because they can be real codes. |
+| 3 | Empty lists become null | A list with no items is stored as null, so consumers test for one kind of "nothing". |
+| 4 | Amounts are never filled | A missing amount stays null. It is never replaced with 0, an average or a value from another row. A zero total and an unknown total mean different things. |
+| 5 | Negative amounts are kept | Credit notes can be negative. They are reported, not changed. |
+| 6 | Flags | A missing `is_backorder` becomes false (as defined in section 11). `is_test` is never null. Every other flag stays null when missing. |
+| 7 | Meaningful nulls are kept | `USER_ITEM.qty` null means not in the cart. `lowest_price` columns are null when the source had `{}`. `ORDER_SUPPLIER_PO.discount` stays null when null. |
+| 8 | Required columns must be filled | Key columns and every column marked Required in section 7 must have a value after cleaning. If not, the row is rejected (see step 10). |
+| 9 | No imputation | No defaults, carry-forward values, lookups or fills. A missing value stays missing. |
+| 10 | Missing, null and empty are the same | The source difference between a missing field, a null and an empty value is not kept. It remains available in bronze. |
+
+### 15.9 Step 7: Clean text
+
+| Rule | Detail |
+|---|---|
+| Encoding | Text is read as UTF-8 to repair the `ÔøΩ` error. Any replacement character that remains is counted by standing check 9. |
+| Hidden characters | Non-breaking spaces become normal spaces. Zero-width and control characters are removed. |
+| Trim | Leading and trailing spaces are removed from every text value. |
+| Inner spaces | Repeated spaces are collapsed to one in identifiers, codes, names and statuses. |
+| Case | Not changed for codes, SKUs and ids, because they are join keys. Status-like columns are trimmed only. A standard letter case is applied only after the distinct values are reviewed (one-time check 3 and open item G4 in gold). |
+| As printed | `bill_to`, `ship_to`, `supplier_address`, `remit_to`, `supplier_name` on bills, `approval_info`, `shipping_address` and `BILL_LINE.name` get only the encoding, hidden-character and trim rules. Inner spacing and case stay as printed. |
+
+### 15.10 Step 8: Apply business rules
+
+The four derived columns are computed from cleaned values, in this step only.
+
+| Column | Input | Rule |
+|---|---|---|
+| `USERS.is_test` | `user_type` | True if an item equals `test`, ignoring letter case. False if the list is null. Never null. |
+| `ORDER_SUPPLIER_PO.supplier_order_id` | Source supplier order id | The id if it looks like a real external id. Null if blank or free text. The exact test for "looks like an id" is open item 12. |
+| `ORDER_SUPPLIER_PO.po_status` | Success and error supplier lists in the bronze order | `SUCCESS` if the supplier is in the success list, `ERROR` if in the error list. If in both, `ERROR` wins. If in neither, the document is rejected (open item 11). |
+| `ORDER_SUPPLIER_PO.channel` | Order id and email event | `web`, `email` or `direct` by the inferred rule in [section 9](#9-derived-columns). Null if the rule cannot decide. |
+
+### 15.11 Step 9: Add audit columns
+
+| Column | Value |
+|---|---|
+| `silver_loaded_at` | Start time of the run. The same for every row written in that run. |
+| `src_meta_at`, `src_trace_id`, `src_meta_src` | From the winning bronze version (`_meta.at`, `_meta.traceId`, `_meta.src`). |
+| `bronze_ingested_at` | From the winning bronze row. |
+| `src_doc_id` | `SUPPLIER_PRODUCT` only. The bronze document the row came from. |
+
+### 15.12 Step 10: Validate
+
+Before anything is written, every document is checked. Failures go to the reject table `silver_rejects`, which is an operational table and not part of the 8-table model.
+
+| Check | Failure means |
+|---|---|
+| Key columns are present and, within a table, unique | The row or document is rejected. |
+| Required columns are filled after cleaning | The row or document is rejected. |
+| `po_status` is `SUCCESS` or `ERROR`. `channel` is `web`, `email`, `direct` or null | The document is rejected. |
+| An `SUP:SKU` key can be split | The item or line is rejected. |
+
+How much is rejected when one row fails:
+
+| Tables | Reject scope | Why |
+|---|---|---|
+| `USERS`, `SUPPLIER_PRODUCT` | The single row | One bad row should not block others. |
+| `USER_ITEM` | The single item. The user is still loaded. | A bad cart or price-cache entry should not remove a user. |
+| `ORDERS`, `ORDER_SUPPLIER_PO`, `ORDER_LINE` | The whole order | Lines and supplier orders must agree with the order header. A partly loaded order would give wrong totals. |
+| `BILLS`, `BILL_LINE` | The whole bill | Same reason. |
+
+`silver_rejects` holds: the silver table, the document id, the bronze batch id, the rule that failed, the column, the raw value (shortened) and the rejection time. A rejected document is retried automatically in later runs if a newer bronze version arrives.
+
+### 15.13 Step 11: Write
+
+| Table type | Write rule |
+|---|---|
+| Top-level (`USERS`, `ORDERS`, `BILLS`) | Upsert by key. Replace the stored row only if the new `src_meta_at` is the same or newer. |
+| Child (`USER_ITEM`, `ORDER_SUPPLIER_PO`, `ORDER_LINE`, `BILL_LINE`) | For each changed parent, remove all its child rows and insert the new set in the same commit as the parent. Arrays can shrink, so merging alone would leave stale rows. |
+| `SUPPLIER_PRODUCT` | Upsert by `supplier_code` and `supplier_sku`. On conflicting names, the latest `src_meta_at` wins (source still to be confirmed). |
+
+Delta commits one table at a time. A reader querying during a run could see an updated order header before its lines. Runs happen in the off-peak window, and gold is built only after the whole silver step has finished, so gold never sees a half-updated order.
+
+## 16. Run-level checks and monitoring
+
+These checks run on every batch, in addition to the standing checks in [section 13.1](#131-standing-checks). The limits are starting points to tune after the first full load.
+
+| # | Check | Starting limit | Action |
+|---|---|---|---|
+| 1 | Conversion failures per column, as a share of non-null source values | Warn above 1% | Warn. A failure in a key or a version date rejects the document. |
+| 2 | Rejected documents per table, as a share of documents in the batch | Warn above 0.5%. Fail the run above 5% | Alert. A failed run stops before gold. |
+| 3 | Silver top-level rows written equal distinct documents in the batch, minus rejects | Exact | Fail the run. |
+| 4 | Child rows written equal the array lengths in bronze for every written document | Exact | Fail the run. |
+
+
+Every run writes one entry per table to the pipeline run log: run id, batch ids processed, rows read, rows written, rows rejected, conversion failures, duration and status.
+
+## 17. Maintenance and reprocessing
+
+| Topic | Rule |
+|---|---|
+| Rebuild from bronze | Silver can always be rebuilt in full from bronze. Use it when a rule changes or a bug is found. |
