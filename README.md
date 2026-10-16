@@ -29,7 +29,7 @@ An end-to-end ETL pipeline that moves procurement data (users, orders and suppli
 
 ## 2. Architecture
 
-Click the image to open it at full size. The SVG zooms without losing sharpness. A PNG copy is in [etl_architecture_diagram.png](doc/etl_architecture_diagram.svg).
+Click the image to open it at full size. The SVG zooms without losing sharpness. A SVG copy is in [etl_architecture_diagram.svg](doc/etl_architecture_diagram.svg).
 
 
 How to read it:
